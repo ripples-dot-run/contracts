@@ -1,0 +1,53 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+cache_path = "cache"
+solc_version = "0.8.36"
+optimizer = true
+# LaunchHook sits 223 bytes past the 24,576 byte runtime limit at 2,000 runs after the audit fixes
+# of 2026-09-07, and a v4 hook cannot be split behind a proxy because its permissions are the low
+# bits of its own address. 1,500 leaves it 799 bytes of headroom. Foundry 1.5.1 will not carry a
+# per-contract profile, so this is the whole set.
+optimizer_runs = 1_500
+
+evm_version = "cancun"
+ffi = false
+# The release record is the one file a script writes. The two sources beside it are read-only
+# and are read by `contracts/test/StockLinkRegistry.t.sol`, which proves the stock link's own
+# source carries no eligibility or jurisdiction vocabulary. Without them that case reports as
+# skipped, which is a gate scan that never ran wearing the colour of one that passed.
+fs_permissions = [
+    { access = "read-write", path = "./deployments.json" },
+    { access = "read", path = "./src/StockLinkRegistry.sol" },
+    { access = "read", path = "./script/DeployStockLink.s.sol" },
+]
+
+[fmt]
+line_length = 100
+tab_width = 4
+bracket_spacing = true
+
+[fuzz]
+runs = 10_000
+
+[invariant]
+runs = 256
+depth = 500
+fail_on_revert = true
+
+[rpc_endpoints]
+rh_mainnet = "https://rpc.mainnet.chain.robinhood.com"
+rh_testnet = "https://rpc.testnet.chain.robinhood.com"
+
+# The gas ledger is checked under this profile, on every machine and in CI. `bytecode_hash = "none"`
+# is what makes it comparable: with the metadata trailer in place the compiled initcode carries a
+# hash of the sources and the compiler settings, which moves the CREATE addresses, and a handful of
+# tests are sensitive to address ordering. Measured 2026-09-05: two worktrees with byte-identical sources,
+# the same forge and the same libraries reported gas twelve units apart, and agreed exactly with
+# the trailer removed. Deploys and verification keep the default profile, so the metadata hash is
+# still in the bytecode that reaches the chain and an explorer can still match it in full.
+[profile.snapshot]
+bytecode_hash = "none"
