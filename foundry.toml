@@ -15,14 +15,59 @@ optimizer_runs = 1_500
 
 evm_version = "cancun"
 ffi = false
-# The release record is the one file a script writes. The two sources beside it are read-only
-# and are read by `contracts/test/StockLinkRegistry.t.sol`, which proves the stock link's own
-# source carries no eligibility or jurisdiction vocabulary. Without them that case reports as
-# skipped, which is a gate scan that never ran wearing the colour of one that passed.
+# The release records are what a deploy writes, one per rail, and the scratch copies beside them
+# are how a test proves a deploy writes a record without touching a committed one. The four
+# sources below are read-only. Two are read by `contracts/test/StockLinkRegistry.t.sol`, which
+# proves the stock link's own source carries no eligibility or jurisdiction vocabulary. The other
+# two are read by `contracts/test/DeployWorkSplitScript.t.sol` and
+# `contracts/test/DeployDualFillScript.t.sol`, which cannot enter a broadcast context and so read
+# the deploy path to pin that the record write is part of it. Without them those cases report as
+# skipped, which is a scan that never ran wearing the colour of one that passed. The agent and
+# combined Dual Fill deploy scripts are read the same way.
+#
+# The Dual Fill rehearsals run on 46630 as separate stages, minutes to hours apart, so each keeps
+# the fills it created in a state file between runs.
 fs_permissions = [
     { access = "read-write", path = "./deployments.json" },
+    # `DeployArc.s.sol` only reads the Arc records: it rebuilds the whole rail, so it stages its
+    # own file beside the record and ops/arc/deploy.sh moves it into place after the broadcast.
+    # The three Dual Fill deploys set one key each and are writable here for the same reason
+    # deployments.json is: the write happens only in a broadcast context, and a key left naming a
+    # factory a failed broadcast never created has no code, which every guard reads as absent.
+    { access = "read-write", path = "./deployments/arc-testnet.json" },
+    { access = "read-write", path = "./deployments/arc-mainnet.json" },
+    { access = "read-write", path = "./deployments/arc-testnet.pending.json" },
+    { access = "read-write", path = "./deployments/arc-mainnet.pending.json" },
+    # The bridged Crosscurrent deploy writes one record per network and the wrapper creation code
+    # the API hands the registrar, on a broadcast run only.
+    { access = "read-write", path = "./deployments/crosscurrent-bridge-robinhood-mainnet.json" },
+    { access = "read-write", path = "./deployments/crosscurrent-bridge-robinhood-testnet.json" },
+    { access = "read-write", path = "./deployments/crosscurrent-bridge-arc-mainnet.json" },
+    { access = "read-write", path = "./deployments/crosscurrent-bridge-arc-testnet.json" },
+    { access = "read-write", path = "./deployments/crosscurrent-bridge-creation-code.json" },
+    { access = "read-write", path = "./cache/work-split-record.json" },
+    { access = "read-write", path = "./cache/dual-fill-record.json" },
+    { access = "read-write", path = "./cache/arc-dual-fill-record.json" },
+    { access = "read-write", path = "./cache/arc-dual-fill-fork-record.json" },
+    { access = "read-write", path = "./cache/arc-linked-dual-fill-record.json" },
+    { access = "read-write", path = "./cache/arc-dual-fill-agent-record.json" },
+    { access = "read-write", path = "./cache/dual-fill-rehearsal-46630.json" },
+    { access = "read-write", path = "./cache/dual-fill-shapes-record.json" },
+    { access = "read-write", path = "./cache/linked-dual-fill-record.json" },
+    # One scratch record per generation test, because a suite's tests run side by side and two
+    # writers on one file read each other's factory.
+    { access = "read-write", path = "./cache/dual-fill-generations.json" },
+    { access = "read-write", path = "./cache/linked-dual-fill-generations.json" },
+    { access = "read-write", path = "./cache/dual-fill-agent-generations.json" },
+    { access = "read-write", path = "./cache/dual-fill-shapes-46630.json" },
+    { access = "read-write", path = "./cache/quote-fee-rehearsal-46630.json" },
+    { access = "read-write", path = "./cache/quote-fee-mistakes-46630.json" },
     { access = "read", path = "./src/StockLinkRegistry.sol" },
     { access = "read", path = "./script/DeployStockLink.s.sol" },
+    { access = "read", path = "./script/DeployWorkSplit.s.sol" },
+    { access = "read", path = "./script/DeployDualFill.s.sol" },
+    { access = "read", path = "./script/DeployDualFillAgent.s.sol" },
+    { access = "read", path = "./script/DeployLinkedDualFill.s.sol" },
 ]
 
 [fmt]

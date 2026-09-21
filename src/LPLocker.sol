@@ -105,7 +105,20 @@ contract LPLocker is IUnlockCallback, IPullEscrow, ReentrancyGuard {
     /// and is kept locally because `free` is read on every sweep and every settlement.
     uint256 public contributedQuote;
     address public allocationVesting;
+    /// The first collection bound to this launch. Every reader of a linked launch asks for it,
+    /// so it stays a plain address even where later waves join it.
     address public linkedCollection;
+    /// Every collection permitted to route into this raise: the first, plus any wave a launch
+    /// that declared itself open to them attached before graduation. A wave routes into the same
+    /// raise and its minters share the same slice, so the declaration is made at create and the
+    /// door closes at settlement.
+    mapping(address collection => bool) public isLinkedCollection;
+    address[] public linkedCollections;
+    /// Whether this launch accepts later waves. Fixed with the allocation, in the launch
+    /// transaction, and read here rather than taken on the factory's word: the promise that no
+    /// second collection can dilute a minter's claim is only worth the contract that holds the
+    /// money.
+    bool public wavesOpen;
     bytes32 private _callbackHash;
 
     /// Which shape of work an unlock is doing. One enum rather than four callback entry points,
@@ -157,6 +170,7 @@ contract LPLocker is IUnlockCallback, IPullEscrow, ReentrancyGuard {
         bytes32 indexed poolId, uint128 liquidity, uint256 raisedQuote, uint256 burned
     );
     event AllocationSet(address indexed vesting, address indexed collection, uint256 slice);
+    event WaveLinked(address indexed collection, uint256 count);
     event Contributed(address indexed from, uint256 quoteIn);
     event OpeningBuy(address indexed recipient, uint256 quoteIn, uint256 tokensOut);
     /// The amounts here are what was **credited** to each side, not what was paid out: since the
@@ -171,18 +185,18 @@ contract LPLocker is IUnlockCallback, IPullEscrow, ReentrancyGuard {
         uint256 treasuryAmount0,
         uint256 treasuryAmount1
     );
-    event Unlocked(address indexed to, uint128 liquidity, uint256 amount0, uint256 amount1);
     event TokenSwept(address indexed token, address indexed to, uint256 amount);
 
     error NotFactory();
     error NotCollection();
+    error WavesClosed();
+    error AlreadyLinked();
     error NotPoolManager();
     error NotAContract();
     error AlreadySeeded();
     error NotSeeded();
     error AlreadySettled();
     error NotGraduated();
-    error StillLocked();
     error NotAuthorized();
     error ZeroLiquidity();
     error SlippageExceeded();
@@ -328,7 +342,9 @@ contract LPLocker is IUnlockCallback, IPullEscrow, ReentrancyGuard {
     /// @notice Bind the linked collection, its vesting contract and the token slice reserved for
     ///         its minters. Set once, by the factory, in the launch transaction. The slice is
     ///         held here and excluded from `free`, exactly as the curve held it.
-    function setAllocation(address vesting, address collection, uint256 slice) external {
+    function setAllocation(address vesting, address collection, uint256 slice, bool wavesOpen_)
+        external
+    {
         if (msg.sender != FACTORY) revert NotFactory();
         if (allocationVesting != address(0)) revert AllocationAlreadySet();
         if (vesting == address(0) || collection == address(0) || slice == 0) {
@@ -338,7 +354,29 @@ contract LPLocker is IUnlockCallback, IPullEscrow, ReentrancyGuard {
         linkedCollection = collection;
         allocationVesting = vesting;
         allocationSlice = slice;
+        wavesOpen = wavesOpen_;
+        _addLinkedCollection(collection);
         emit AllocationSet(vesting, collection, slice);
+    }
+
+    /// @notice Attach a later wave's collection to this raise. The factory deploys the
+    ///         collection and calls this in the same transaction. Refused where the launch did
+    ///         not declare itself open to waves, and refused once the raise has settled: after
+    ///         that there is nothing left to route into and the slice is already divided.
+    function addWaveCollection(address collection) external {
+        if (msg.sender != FACTORY) revert NotFactory();
+        if (!wavesOpen) revert WavesClosed();
+        if (allocationVesting == address(0)) revert AllocationUnset();
+        if (settled) revert AlreadySettled();
+        if (collection == address(0)) revert AllocationUnset();
+        if (collection.code.length == 0) revert NotAContract();
+        if (isLinkedCollection[collection]) revert AlreadyLinked();
+        _addLinkedCollection(collection);
+    }
+
+    /// How many collections route into this raise, which is the wave count.
+    function linkedCollectionCount() external view returns (uint256) {
+        return linkedCollections.length;
     }
 
     /// @notice Take quote the linked collection routed out of a mint and record it against the
@@ -349,9 +387,7 @@ contract LPLocker is IUnlockCallback, IPullEscrow, ReentrancyGuard {
     ///         alongside what the curve position raised. The hook keeps the accounting and holds
     ///         no money, so the two have to be the same contract, and this is it.
     function contribute(uint256 quoteIn) external nonReentrant {
-        if (msg.sender != linkedCollection || linkedCollection == address(0)) {
-            revert NotCollection();
-        }
+        if (!isLinkedCollection[msg.sender]) revert NotCollection();
         if (settled) revert AlreadySettled();
         _pullExact(IERC20(QUOTE), msg.sender, quoteIn);
         contributedQuote += quoteIn;
@@ -526,48 +562,12 @@ contract LPLocker is IUnlockCallback, IPullEscrow, ReentrancyGuard {
         emit FeesCollected(CREATOR, to, creator0, creator1, treasury0, treasury1);
     }
 
-    /// @notice Withdraw principal once the lock has expired. Only the treasury may call,
-    ///         and only after `UNLOCK_AT`; a permanent lock never reaches this. Fees the
-    ///         position earned are collected and split first, so the withdrawal moves
-    ///         principal alone.
-    function unlock(uint128 amount, uint256 minAmount0, uint256 minAmount1, address receiver)
-        external
-        nonReentrant
-        returns (uint256 amount0, uint256 amount1)
-    {
-        if (!seeded) revert NotSeeded();
-        if (msg.sender != treasury()) revert NotAuthorized();
-        if (UNLOCK_AT == type(uint64).max || block.timestamp < UNLOCK_AT) revert StillLocked();
-        if (receiver == address(0)) revert NotAuthorized();
-        if (amount == 0 || amount > liquidity) revert ZeroLiquidity();
-
-        // Removing liquidity credits the position's uncollected fees along with its principal, so
-        // sweep them first. Otherwise the receiver the treasury names would also take the
-        // creator's share of fees the pool had already earned.
-        _collectFees();
-
-        uint256 before0 = _balanceOf(_key.currency0, receiver);
-        uint256 before1 = _balanceOf(_key.currency1, receiver);
-        liquidity -= amount;
-        bytes memory res = _execute(
-            Job.Liquidity,
-            abi.encode(
-                CallbackData({
-                    key: _key,
-                    tickLower: tickLower,
-                    tickUpper: tickUpper,
-                    liquidityDelta: -int256(uint256(amount)),
-                    amount0Limit: minAmount0,
-                    amount1Limit: minAmount1,
-                    receiver: receiver
-                })
-            )
-        );
-        (amount0, amount1) = abi.decode(res, (uint256, uint256));
-        _verifyReceived(_key.currency0, receiver, before0, amount0);
-        _verifyReceived(_key.currency1, receiver, before1, amount1);
-        emit Unlocked(receiver, amount, amount0, amount1);
-    }
+    /// There is no withdrawal of principal, by construction. A position opened by this contract is
+    /// locked for good: `UNLOCK_AT` is `type(uint64).max` on every locker the factory deploys, and
+    /// the factory refuses any other value. The function that used to withdraw after an expiry was
+    /// removed with the timed lock it served, so the deployed bytecode carries no path that moves
+    /// the principal out, for the treasury or for anyone. Fees are a separate balance and are
+    /// still collected and split by `collectFees` above.
 
     function unlockCallback(bytes calldata raw) external returns (bytes memory) {
         if (msg.sender != address(POOL_MANAGER)) revert NotPoolManager();
@@ -850,6 +850,12 @@ contract LPLocker is IUnlockCallback, IPullEscrow, ReentrancyGuard {
 
     /// Pull `amount` and prove it landed by weighing both sides. A quote that reports success
     /// without moving funds, or one that takes a cut on transfer, is caught here.
+    function _addLinkedCollection(address collection) private {
+        isLinkedCollection[collection] = true;
+        linkedCollections.push(collection);
+        emit WaveLinked(collection, linkedCollections.length);
+    }
+
     function _pullExact(IERC20 token, address from, uint256 amount) private {
         uint256 fromBefore = token.balanceOf(from);
         uint256 balanceBefore = token.balanceOf(address(this));

@@ -1008,6 +1008,35 @@ contract Deploy is Script {
         return _recordedAddress(network, "stockLinkRegistry");
     }
 
+    /// The same for the agent launchpad, which `DeployAgentTreasury.s.sol` also leaves to this
+    /// file. The web gates the whole agent rail on this key, so dropping it takes the launch
+    /// type, every charter panel and every agent launch's identity off the site at once.
+    function agentTreasuryFactoryFor(string memory network) internal view returns (address) {
+        address named = vm.envOr("AGENT_TREASURY_FACTORY", address(0));
+        if (named != address(0)) return named;
+        return _recordedAddress(network, "agentTreasuryFactory");
+    }
+
+    /// The same for the launches that pay a commission, which `DeployWorkSplit.s.sol` also leaves
+    /// to this file. Dropping it takes the commission control off the launch form and leaves
+    /// every live split unvouched for, so a scout reading a rate on a page has nothing to check
+    /// it against.
+    function workSplitFactoryFor(string memory network) internal view returns (address) {
+        address named = vm.envOr("WORK_SPLIT_FACTORY", address(0));
+        if (named != address(0)) return named;
+        return _recordedAddress(network, "workSplitFactory");
+    }
+
+    /// The registry the splits above read a buyer's scout from. It is deployed by that factory
+    /// rather than on its own, and it is immutable on every split, so it is carried forward with
+    /// it: a record naming the factory and not the registry describes half a deployment, and the
+    /// bind step has no address to send a buyer to.
+    function scoutRegistryFor(string memory network) internal view returns (address) {
+        address named = vm.envOr("SCOUT_REGISTRY", address(0));
+        if (named != address(0)) return named;
+        return _recordedAddress(network, "scoutRegistry");
+    }
+
     /// The hook a network's record already names, which is the hook every market on that network
     /// is keyed to. Zero before the first deployment, and on any chain the record has no entry
     /// for. Read by `_resolveHook` before it mines.
@@ -1106,6 +1135,18 @@ contract Deploy is Script {
         address stockLink = stockLinkRegistryFor(_networkKey());
         if (stockLink != address(0)) {
             vm.serializeAddress(obj, "stockLinkRegistry", stockLink);
+        }
+        address agents = agentTreasuryFactoryFor(_networkKey());
+        if (agents != address(0)) {
+            vm.serializeAddress(obj, "agentTreasuryFactory", agents);
+        }
+        address workSplits = workSplitFactoryFor(_networkKey());
+        if (workSplits != address(0)) {
+            vm.serializeAddress(obj, "workSplitFactory", workSplits);
+        }
+        address scouts = scoutRegistryFor(_networkKey());
+        if (scouts != address(0)) {
+            vm.serializeAddress(obj, "scoutRegistry", scouts);
         }
         if (block.chainid == RH_TESTNET || block.chainid == RH_MAINNET) {
             vm.serializeAddress(

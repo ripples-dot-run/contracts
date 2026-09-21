@@ -10,9 +10,17 @@ pragma solidity 0.8.36;
 /// an asset once, to one contract, and grant each router after that an amount and an expiry
 /// instead of a second unbounded approval.
 ///
-/// Only `transferFrom` is declared, because that is the only call a router makes. Granting and
-/// reading an allowance is the wallet's business and is done against Permit2 directly.
+/// A router only ever calls `transferFrom`; a wallet grants its own allowance against Permit2
+/// directly and needs nothing declared here. `approve` is declared because a **contract** that
+/// trades through a router has to grant its own allowance in Solidity, which is the case
+/// `AgentTreasury` is in: it approves the ledger, grants the router the size of one order with a
+/// short expiry, and clears both inside the same call.
 interface IAllowanceTransfer {
+    /// @notice Grant `spender` an allowance of `amount` of `token` until `expiration`, against
+    ///         the caller's own balance. `type(uint160).max` never decrements; an expiration in
+    ///         the past closes a grant.
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+
     /// @notice Move `amount` of `token` from `from` to `to` against the allowance `from` granted
     ///         the caller. Reverts when the allowance is short or has expired.
     function transferFrom(address from, address to, uint160 amount, address token) external;

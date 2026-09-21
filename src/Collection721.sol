@@ -68,6 +68,12 @@ interface IAllocationRecorder {
     function recordContribution(address minter, uint256 amount) external;
 }
 
+/// The same credit, for a launch whose claim belongs to the piece. The ids do not exist yet
+/// when a mint routes, so the range the mint is about to issue is passed instead of read.
+interface IObjectRecorder {
+    function recordContribution(uint256 startId, uint256 qty, uint256 amount) external;
+}
+
 /// @notice A single drop. Collectors approve the quote token and mint directly. Revenue is
 ///         split creator/protocol on withdrawal, and only quote pulled by a mint is splittable.
 contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullEscrow {
@@ -114,6 +120,9 @@ contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullE
     address public curveSink;
     address public allocationVesting;
     uint96 public mintToCurveBps;
+    /// Whether the routed quote is credited to the piece rather than to the minter's wallet.
+    /// Set with the link, and read on every mint to pick which recorder is called.
+    bool public objectClaim;
 
     uint256 public totalSupply;
     mapping(address minter => uint256) public mintedBy;
@@ -126,7 +135,9 @@ contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullE
     uint256 public protocolWithdrawn;
 
     event Minted(address indexed to, uint256 indexed tokenId);
-    event LinkedToCurve(address indexed curve, address indexed vesting, uint96 mintToCurveBps);
+    event LinkedToCurve(
+        address indexed curve, address indexed vesting, uint96 mintToCurveBps, bool objectClaim
+    );
     event Revealed(uint256 indexed tokenId, string uri);
     event BaseURISet(string uri);
     event ContractURIUpdated();
@@ -214,8 +225,17 @@ contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullE
     /// @notice Wire this collection to its launch's bonding curve, once, at deploy time. Only
     ///         the deploying factory can call, and every existing standalone drop leaves this
     ///         unset, so their mint paths are unchanged. `mintToCurveBps` of each mint's quote
-    ///         is then routed into the curve and recorded for the minter's vested allocation.
-    function linkToCurve(address curveSink_, address vesting_, uint96 mintToCurveBps_) external {
+    ///         is then routed into the curve and recorded for the vested allocation.
+    ///
+    ///         `objectClaim_` picks which vesting contract is on the other end and therefore
+    ///         who the allocation belongs to: the wallet that minted, or the piece it minted.
+    ///         The launch declares it at create, it is wired here once, and no call moves it.
+    function linkToCurve(
+        address curveSink_,
+        address vesting_,
+        uint96 mintToCurveBps_,
+        bool objectClaim_
+    ) external {
         if (msg.sender != FACTORY) revert NotFactory();
         if (curveSink != address(0)) revert AlreadyLinked();
         if (curveSink_ == address(0) || vesting_ == address(0)) revert ZeroAddress();
@@ -239,7 +259,8 @@ contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullE
         curveSink = curveSink_;
         allocationVesting = vesting_;
         mintToCurveBps = mintToCurveBps_;
-        emit LinkedToCurve(curveSink_, vesting_, mintToCurveBps_);
+        objectClaim = objectClaim_;
+        emit LinkedToCurve(curveSink_, vesting_, mintToCurveBps_, objectClaim_);
     }
 
     /// @notice Mint by approving the quote first. Credits only the quote the balance actually
@@ -255,7 +276,7 @@ contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullE
         uint256 routed;
         if (due != 0) {
             _pullExact(msg.sender, due);
-            routed = _attribute(msg.sender, due);
+            routed = _attribute(msg.sender, due, qty);
         }
         if (routed < minRoutedTotal) revert SlippageExceeded();
         _issue(msg.sender, qty);
@@ -486,7 +507,8 @@ contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullE
                 origin,
                 "/v1/collection-assets/",
                 Strings.toHexString(address(this)),
-                "/contract.json"
+                "/contract.json?chainId=",
+                Strings.toString(block.chainid)
             );
         } catch {
             return "";
@@ -500,7 +522,7 @@ contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullE
     /// The routed amount is capped at what the curve still needs to graduate: the pool is seeded
     /// at the curve's own price, so quote past that ceiling would never reach the pool and would
     /// be swept to the treasury instead. Anything truncated stays ordinary mint revenue.
-    function _attribute(address minter, uint256 due) private returns (uint256 routed) {
+    function _attribute(address minter, uint256 due, uint256 qty) private returns (uint256 routed) {
         if (due == 0) return 0;
         address sink = curveSink;
         if (sink == address(0)) {
@@ -526,7 +548,13 @@ contract Collection721 is ERC721, ERC2981, Ownable2Step, ReentrancyGuard, IPullE
         ICurveSink(sink).contribute(routed);
         QUOTE.forceApprove(sink, 0);
         if (QUOTE.balanceOf(address(this)) != before - routed) revert WrongPayment();
-        IAllocationRecorder(allocationVesting).recordContribution(minter, routed);
+        // The ids this mint is about to issue start one past the supply, and `_issue` is the
+        // only thing that moves it, so the range is settled here and minted a line later.
+        if (objectClaim) {
+            IObjectRecorder(allocationVesting).recordContribution(totalSupply + 1, qty, routed);
+        } else {
+            IAllocationRecorder(allocationVesting).recordContribution(minter, routed);
+        }
         attributedReceipts += due - routed;
     }
 

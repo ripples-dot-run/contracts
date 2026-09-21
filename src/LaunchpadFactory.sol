@@ -2,6 +2,7 @@
 pragma solidity 0.8.36;
 
 import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { IERC20Metadata } from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import { IERC721 } from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import { Ownable, Ownable2Step } from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -34,7 +35,12 @@ contract LaunchpadFactory is Ownable2Step, ReentrancyGuard {
     /// creator's approve and their launch can never pull more than that from an outstanding
     /// allowance. It is an 18-decimal figure because the fee token is 18-decimal; a drop priced
     /// in a 6- or 8-decimal quote does not move it (DQ3).
-    uint256 public constant MAX_LAUNCH_FEE = 1e17;
+    /// Ceiling on the launch fee: a tenth of one whole unit of `FEE_TOKEN`, derived from that
+    /// token's own decimals rather than written as an 18-decimal literal. The literal was `1e17`,
+    /// which is a tenth of one WETH and bounds nothing at all against a six-decimal fee token: on
+    /// a USDC rail the same number admits a hundred billion USDC. Read once at construction, so
+    /// this stays a single immutable load and every 18-decimal rail keeps exactly `1e17`.
+    uint256 public immutable MAX_LAUNCH_FEE;
     uint256 public constant MAX_ASSET_ORIGIN_BYTES = 128;
 
     /// The **fee** token, fixed for the life of this factory, and the default quote a drop
@@ -130,9 +136,25 @@ contract LaunchpadFactory is Ownable2Step, ReentrancyGuard {
             revert ZeroAddress();
         }
         if (quote.code.length == 0) revert NotAContract();
+        MAX_LAUNCH_FEE = _feeCeiling(quote);
         QUOTE = IERC20(quote);
         treasury = treasury_;
         platformSigner = platformSigner_;
+    }
+
+    /// A tenth of one whole unit of the fee token, which is what `MAX_LAUNCH_FEE` has always been
+    /// written to mean. An asset that does not answer `decimals()` cannot be bounded and is
+    /// refused here rather than silently admitted against an 18-decimal assumption, and a
+    /// zero-decimal asset is refused because a tenth of one unit of it is nothing.
+    function _feeCeiling(address asset) private view returns (uint256) {
+        uint8 units;
+        try IERC20Metadata(asset).decimals() returns (uint8 d) {
+            units = d;
+        } catch {
+            revert NotAContract();
+        }
+        if (units == 0 || units > 18) revert NotAContract();
+        return 10 ** units / 10;
     }
 
     function createCollection(CollectionParams calldata p) external nonReentrant returns (address) {

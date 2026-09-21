@@ -16,9 +16,25 @@ Ripples runs on Solana as well. That program is not in this repository.
 | Quote registry | [`0x2BA6B82cD29Bf81DD26691Bd9625B0942527E9Ba`](https://robinhoodchain.blockscout.com/address/0x2BA6B82cD29Bf81DD26691Bd9625B0942527E9Ba) |
 | Launch router | [`0x22DB9B2c6C6DB56ABC3fc196E4bC1FBb9c4338a6`](https://robinhoodchain.blockscout.com/address/0x22DB9B2c6C6DB56ABC3fc196E4bC1FBb9c4338a6) |
 | Buyback burner | [`0xA206C88C69C241A8BdF02636b890E7573bFfC20f`](https://robinhoodchain.blockscout.com/address/0xA206C88C69C241A8BdF02636b890E7573bFfC20f) |
+| Burn router (creator leg of $RIPPLES and $KOI) | [`0x762c3A161965B9a8bb190c28d5FC7AFa7631D697`](https://robinhoodchain.blockscout.com/address/0x762c3A161965B9a8bb190c28d5FC7AFa7631D697) |
+| Ops router (treasury of both factories) | [`0xD07b32BECEaee0e23E88F892e81ee76CF9bED48E`](https://robinhoodchain.blockscout.com/address/0xD07b32BECEaee0e23E88F892e81ee76CF9bED48E) |
+
+The quote-fee generation, live since 16 September 2026. Its hook takes the 1% fee from the quote
+side of every swap, whichever way the trade goes, and its factory pays no creator share of that
+fee; a creator's own charge is the only one they earn. Launches created on it use these.
+
+| | |
+| --- | --- |
+| Quote-fee hook | [`0x5Df831cbb133191E06a9088AEb98b0C5Fa1beacC`](https://robinhoodchain.blockscout.com/address/0x5Df831cbb133191E06a9088AEb98b0C5Fa1beacC) |
+| Quote-fee factory | [`0x33C7445d8D2f1EAB28ac5ad94B66C8b46645D5C4`](https://robinhoodchain.blockscout.com/address/0x33C7445d8D2f1EAB28ac5ad94B66C8b46645D5C4) |
+| Quote-fee router (70% buyback, 30% treasury) | [`0xC8842e8196E96Cef0988Cffb144722fDe8a8a684`](https://robinhoodchain.blockscout.com/address/0xC8842e8196E96Cef0988Cffb144722fDe8a8a684) |
+| Quote-fee registry | [`0xcaE4F123a9C310A66E7fB654cb935247Ab8134c9`](https://robinhoodchain.blockscout.com/address/0xcaE4F123a9C310A66E7fB654cb935247Ab8134c9) |
+| Quote-fee launch lens | [`0x7752b56994E5800b9A2AD61420EC0Bb1173f0fC0`](https://robinhoodchain.blockscout.com/address/0x7752b56994E5800b9A2AD61420EC0Bb1173f0fC0) |
+| Quote-fee launch router | [`0x2bF8081c38bF6Edc904D02550cfAF142740c0F73`](https://robinhoodchain.blockscout.com/address/0x2bF8081c38bF6Edc904D02550cfAF142740c0F73) |
 
 Verify deployed bytecode against the verified sources before trusting an address. The full record,
-read live from the chain, is at [ripples.run/proof](https://ripples.run/proof).
+read live from the chain, is at [ripples.run/proof](https://ripples.run/proof). $RIPPLES and $KOI
+stay on the launch hook for good: a Uniswap v4 pool's hook is part of its key.
 
 Contract ownership is held by a Safe.
 

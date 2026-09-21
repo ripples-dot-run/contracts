@@ -31,8 +31,15 @@ contract AllocationVesting is ReentrancyGuard {
     uint64 public immutable VEST_DURATION;
     uint64 public immutable VEST_CLIFF;
 
-    /// The one collection whose mints record contributions here. Set once by the factory.
+    /// The first collection whose mints record here, bound once by the factory in the launch
+    /// transaction. Kept as a plain address because every reader of a linked launch asks for it.
     address public collection;
+    /// Every collection that may record, which is the first one plus any later wave the launch
+    /// declared itself open to. A wave shares the same slice pro rata with everyone who routed,
+    /// so a launch that accepts one says so before its first mint and can never add one after
+    /// graduation has fixed the contributions.
+    mapping(address collection => bool) public isRecorder;
+    address[] public recorders;
     /// Graduation timestamp. `graduated` distinguishes an unset clock from timestamp zero.
     uint64 public graduatedAt;
     bool public graduated;
@@ -64,6 +71,7 @@ contract AllocationVesting is ReentrancyGuard {
     uint256 public totalFinalizedContribution;
 
     event CollectionSet(address indexed collection);
+    event RecorderAdded(address indexed collection);
     event ContributionRecorded(address indexed minter, uint256 amount, uint256 total);
     event Graduated(uint64 timestamp, uint256 slice);
     event Claimed(address indexed minter, uint256 amount);
@@ -76,6 +84,7 @@ contract AllocationVesting is ReentrancyGuard {
     error NotCollection();
     error NotCurve();
     error CollectionAlreadySet();
+    error AlreadyRecorder();
     error CollectionUnset();
     error AlreadyGraduated();
     error NothingToClaim();
@@ -105,13 +114,33 @@ contract AllocationVesting is ReentrancyGuard {
         if (collection_ == address(0)) revert ZeroAddress();
         if (collection_.code.length == 0) revert NotAContract();
         collection = collection_;
+        _addRecorder(collection_);
         emit CollectionSet(collection_);
+    }
+
+    /// @notice Bind a later wave's collection. The factory checks the launch declared itself
+    ///         open to waves before it calls; graduation closes the door here regardless,
+    ///         because after it the contributions are snapshotted and a new collection could
+    ///         only dilute claims that are already fixed.
+    function addCollection(address collection_) external {
+        if (msg.sender != FACTORY) revert NotFactory();
+        if (collection == address(0)) revert CollectionUnset();
+        if (graduated) revert AlreadyGraduated();
+        if (collection_ == address(0)) revert ZeroAddress();
+        if (collection_.code.length == 0) revert NotAContract();
+        if (isRecorder[collection_]) revert AlreadyRecorder();
+        _addRecorder(collection_);
+    }
+
+    /// How many collections record here, which is the wave count.
+    function recorderCount() external view returns (uint256) {
+        return recorders.length;
     }
 
     /// @notice Credit a minter's routed quote toward their future allocation. Only the linked
     ///         collection may call, and only before graduation snapshots the contributions.
     function recordContribution(address minter, uint256 amount) external {
-        if (msg.sender != collection) revert NotCollection();
+        if (!isRecorder[msg.sender]) revert NotCollection();
         if (graduated) revert AlreadyGraduated();
         if (amount == 0) return;
         if (minter == address(0)) revert ZeroAddress();
@@ -211,6 +240,12 @@ contract AllocationVesting is ReentrancyGuard {
             balanceAfter > balanceBefore || balanceBefore - balanceAfter != amount
                 || toAfter < toBefore || toAfter - toBefore != amount
         ) revert TransferMismatch();
+    }
+
+    function _addRecorder(address collection_) private {
+        isRecorder[collection_] = true;
+        recorders.push(collection_);
+        emit RecorderAdded(collection_);
     }
 
     function _finalize(address minter) private {

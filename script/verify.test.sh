@@ -77,16 +77,34 @@ run_verify() {
     >"$1.out" 2>"$1.err" || true
 }
 
-# A record is the only source of a deployment's library links, its quote registry and its stock
-# link registry, and 4663 (the one chain with a Blockscout instance) is still a v1 deployment.
-# So the v2 branches are driven from a fixture record rather than left uncovered until the
-# mainnet redeploy, which is exactly when a broken verify.sh would be most expensive.
+# Historical generations use explicit fixtures so a new production deployment cannot silently
+# change what the legacy tests exercise. Current-generation checks still read deployments.json.
+v1_record() {
+  jq '.robinhoodMainnet
+      | del(.quoteRegistry, .stockLinkRegistry, .launchRouter)
+      | .libraries = {
+          CollectionDeployer: "0x1111111111111111111111111111111111111111",
+          LaunchDeployer: "0x2222222222222222222222222222222222222222",
+          LockerDeployer: "0x3333333333333333333333333333333333333333",
+          VestingDeployer: "0x4444444444444444444444444444444444444444"
+        }
+      | { robinhoodMainnet: . }' "$ROOT/deployments.json" >"$1"
+}
+
 v2_record() {
   jq '.robinhoodMainnet
       + { quoteRegistry: "0xQR", stockLinkRegistry: "0xSL" }
       + { libraries: (.robinhoodMainnet.libraries + { TokenDeployer: "0xTD" }) }
       | { robinhoodMainnet: . }
-      | .robinhoodMainnet.chainId = 4663' "$ROOT/deployments.json" >"$1"
+      | .robinhoodMainnet.chainId = 4663' "$v1_fixture" >"$1"
+}
+
+# A record whose commission rail is deployed. Both keys are null on every committed record until
+# the first `DeployWorkSplit` run, so the filled shape needs a fixture of its own.
+work_record() {
+  jq --arg scout "$2" '.robinhoodMainnet
+      + { workSplitFactory: "0xWS", scoutRegistry: $scout }
+      | { robinhoodMainnet: . }' "$ROOT/deployments.json" >"$1"
 }
 
 expect() {
@@ -117,7 +135,7 @@ refute "the token factory the verifier accepts is never sent library links" "$sp
   "src/TokenLaunchFactory.sol:TokenLaunchFactory --constructor-args 0xdeadbeef --libraries"
 
 # Each library is still verified in its own right, from the address deployments.json records.
-for name in CollectionDeployer LaunchDeployer LockerDeployer VestingDeployer; do
+for name in $(jq -r ' .robinhoodMainnet.libraries | keys[]' "$ROOT/deployments.json"); do
   addr=$(jq -r --arg n "$name" '.robinhoodMainnet.libraries[$n]' "$ROOT/deployments.json")
   [ "$addr" != "null" ] || { echo "FAIL: deployments.json records no $name for 4663" >&2; FAILED=1; continue; }
   expect "$name is itself verified" "$split_log" "$addr src/libraries/$name.sol:$name"
@@ -128,7 +146,7 @@ done
 linked_log="$STUB_HOME/linked.log"
 run_verify "$linked_log" 1 0
 
-for name in CollectionDeployer LaunchDeployer LockerDeployer VestingDeployer; do
+for name in $(jq -r ' .robinhoodMainnet.libraries | keys[]' "$ROOT/deployments.json"); do
   addr=$(jq -r --arg n "$name" '.robinhoodMainnet.libraries[$n]' "$ROOT/deployments.json")
   [ "$addr" != "null" ] || continue
   expect "$name is linked from deployments.json on the retry" "$linked_log" \
@@ -178,11 +196,15 @@ expect "and the v1 tuple is the fallback" "$split_log" \
   "CollectionCreated(address,address,(string,string,uint256,uint256,uint256,uint64,uint64,uint8,string,string,uint96)) --json"
 
 # A v1 record links four libraries and names no registries; nothing here may invent a fifth.
-refute "a v1 record is not asked for TokenDeployer" "$split_log" \
+v1_fixture="$STUB_HOME/deployments-v1.json"
+v1_record "$v1_fixture"
+v1_log="$STUB_HOME/v1.log"
+run_verify "$v1_log" 1 1 1 "$v1_fixture" curve
+refute "a v1 record is not asked for TokenDeployer" "$v1_log" \
   "src/libraries/TokenDeployer.sol:TokenDeployer"
-expect "and the absent quote registry is called out, not silently skipped" "$split_log.err" \
+expect "and the absent quote registry is called out, not silently skipped" "$v1_log.err" \
   "no quoteRegistry in the record"
-expect "and so is the absent stock link registry" "$split_log.err" \
+expect "and so is the absent stock link registry" "$v1_log.err" \
   "no stockLinkRegistry in the record"
 
 v2_fixture="$STUB_HOME/deployments-v2.json"
@@ -214,17 +236,48 @@ run_verify "$missing_log" 1 1 1 "$missing_lib"
 expect "a v2 record missing a deployer library is refused" "$missing_log.err" \
   "a v2 record must name all five deployer libraries"
 
-# The pre-pool generation, which is what 46630 still carries. Its sources come back with a
+# The commission rail. A scout holds an artist to a published rate by reading the contract that
+# enforces it, so an unverified WorkSplitFactory is a rate nobody can check. Neither key is filled
+# on any network yet, so the committed record must say so rather than report full coverage.
+expect "an unrecorded commission rail is called out, not silently skipped" "$split_log.err" \
+  "no workSplitFactory in the record"
+
+work_fixture="$STUB_HOME/deployments-work.json"
+work_record "$work_fixture" 0x5555555555555555555555555555555555555555
+work_log="$STUB_HOME/work.log"
+run_verify "$work_log" 1 1 1 "$work_fixture"
+
+expect "the work split factory verifies with its one-address constructor" "$work_log" \
+  "abi-encode c(address) 0x8888888888888888888888888888888888888888"
+expect "the work split factory itself is verified" "$work_log" \
+  "0xWS src/WorkSplitFactory.sol:WorkSplitFactory"
+# The registry is created by CREATE inside the factory's constructor, so it has no creation
+# transaction: the guess is tried first and the rebuild uses its one immutable.
+expect "and the scout registry is verified from its own immutable" "$work_log" \
+  "0x5555555555555555555555555555555555555555 src/ScoutRegistry.sol:ScoutRegistry --constructor-args"
+
+# The record and the factory disagree about the registry only if the record was edited by hand.
+# The address the splits actually read is the factory's, and the record's is named as the error.
+mismatch_fixture="$STUB_HOME/deployments-work-mismatch.json"
+work_record "$mismatch_fixture" 0x1234567890123456789012345678901234567890
+mismatch_log="$STUB_HOME/work-mismatch.log"
+run_verify "$mismatch_log" 1 1 1 "$mismatch_fixture"
+expect "a record naming the wrong scout registry is reported" "$mismatch_log.err" \
+  "scoutRegistry in the record is 0x1234567890123456789012345678901234567890"
+expect "and the registry the factory names is the one verified" "$mismatch_log" \
+  "0x5555555555555555555555555555555555555555 src/ScoutRegistry.sol:ScoutRegistry"
+
+# The pre-pool generation remains covered independently of the current deployment. Its sources come back with a
 # path-limited checkout of the network's `sourceCommit`, as the header of verify.sh says, so
 # these branches have to keep working.
 curve_log="$STUB_HOME/curve.log"
-run_verify "$curve_log" 1 1 1 "$ROOT/deployments.json" curve
+run_verify "$curve_log" 1 1 1 "$v1_fixture" curve
 expect "a curve-generation locker verifies with the seven-argument constructor" \
   "$curve_log" "abi-encode c(address,address,address,address,address,uint96,uint64)"
 expect "and its curve is verified beside it" "$curve_log" "src/BondingCurve.sol:BondingCurve"
 
 legacy_log="$STUB_HOME/legacy.log"
-run_verify "$legacy_log" 0 1 1 "$ROOT/deployments.json" curve
+run_verify "$legacy_log" 0 1 1 "$v1_fixture" curve
 
 expect "a locker from before the split verifies with the five-argument constructor" \
   "$legacy_log" "abi-encode c(address,address,address,address,uint64)"

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Verify deployed contracts on Robinhood Chain Blockscout.
+# Publish the source of deployed contracts, so anyone can read the code a Ripples launch runs on.
 #
 #   RPC_URL=... script/verify.sh <chain-id> <factory-address>
 #
-# <factory-address> is the LaunchpadFactory (NFT rail). Robinhood testnet currently has no
-# supported Blockscout verification endpoint; on mainnet the payment token is canonical WETH.
+# Sources go to Sourcify, which carries both Robinhood chains; the Blockscout explorer reads them
+# from there. See the VERIFIER note below for why Sourcify rather than Blockscout directly.
+#
+# <factory-address> is the LaunchpadFactory (NFT rail). On mainnet the payment token is canonical
+# WETH.
 #
 # Optional environment (token rail, deployed by the same Deploy.s.sol run):
 #   TOKEN_FACTORY    TokenLaunchFactory address. Set it to also verify the token rail:
@@ -31,8 +34,8 @@
 # settings are inputs too: if foundry.toml, remappings.txt or a lib/ pin has moved since the
 # deploy, put those back as well.
 #
-# Factory-deployed children (collections, tokens, curves, lockers, vesting) are created by
-# CREATE inside a user or agent transaction, so they have no standalone creation transaction
+# Factory-deployed children (collections, tokens, curves, lockers, vesting, and the scout
+# registry) are created by CREATE inside another transaction, so they have no creation transaction
 # for --guess-constructor-args to read. Each child is tried with --guess-constructor-args first
 # (Blockscout can match it from its internal creation trace), and on failure its constructor
 # arguments are rebuilt: the collection's from the CollectionCreated event bytes spliced onto
@@ -49,15 +52,17 @@ FROM_BLOCK="${FROM_BLOCK:-0}"
 : "${RPC_URL:?set RPC_URL to the chain being verified}"
 
 # Robinhood Chain publishes one Blockscout instance, and it indexes mainnet only.
-# Testnet deploys have no explorer to verify against.
-if [ "$CHAIN_ID" != "4663" ]; then
-  echo "chain $CHAIN_ID has no Blockscout instance; nothing to verify" >&2
-  exit 0
-fi
-# Blockscout sits behind Cloudflare and answers a burst of verification calls with a challenge
-# page where forge expects JSON. Point VERIFIER_URL at ops/rh-rpc-proxy.mjs to get through it.
-# VERIFIER_KEY is the explorer API key (BLOCKSCOUT_API_KEY in keys.env). Without one the
-# instance rate-limits after about two contracts and the rest report "Too many requests".
+# Sourcify by default, on both networks.
+#
+# Blockscout's API sits behind a Cloudflare managed challenge that answers every endpoint with a
+# 403 and an HTML interstitial where forge expects JSON, so nothing verifies through it from a
+# terminal. Sourcify carries both Robinhood chains, takes the same standard input, and is not
+# challenged; Blockscout reads it, so a contract verified there shows its source on the explorer
+# without anyone solving a captcha.
+#
+# VERIFIER=blockscout with VERIFIER_URL pointed at ops/rh-rpc-proxy.mjs is still here for the day
+# the challenge lifts. VERIFIER_KEY is the explorer API key (BLOCKSCOUT_API_KEY in keys.env).
+VERIFIER="${VERIFIER:-sourcify}"
 VERIFIER_URL="${VERIFIER_URL:-https://robinhoodchain.blockscout.com/api}"
 
 command -v jq >/dev/null 2>&1 || { echo "jq is required" >&2; exit 1; }
@@ -68,6 +73,15 @@ note_failure() { FAILURES+=("$1"); echo "!! $1" >&2; }
 # --rpc-url is mandatory: --guess-constructor-args reads the creation input over it, and
 # without it the guess silently degrades and the args never match.
 verify() {
+  if [ "$VERIFIER" = "sourcify" ]; then
+    forge verify-contract \
+      --verifier sourcify \
+      --chain-id "$CHAIN_ID" \
+      --rpc-url "$RPC_URL" \
+      --watch \
+      "$@"
+    return
+  fi
   forge verify-contract \
     --verifier blockscout \
     --verifier-url "$VERIFIER_URL" \
@@ -77,6 +91,7 @@ verify() {
     --watch \
     "$@"
 }
+
 
 read_addr() { local t="$1" sig="$2"; shift 2; cast call "$t" "$sig" "$@" --rpc-url "$RPC_URL" | awk '{print $1}'; }
 call() { read_addr "$FACTORY" "$1"; }
@@ -158,6 +173,19 @@ esac
 QUOTE_REGISTRY_RECORDED=$(echo "$DEPLOYMENT" | jq -r '.quoteRegistry // empty')
 STOCK_LINK_RECORDED=$(echo "$DEPLOYMENT" | jq -r '.stockLinkRegistry // empty')
 LAUNCH_ROUTER_RECORDED=$(echo "$DEPLOYMENT" | jq -r '.launchRouter // empty')
+AGENT_FACTORY_RECORDED=$(echo "$DEPLOYMENT" | jq -r '.agentTreasuryFactory // empty')
+WORK_SPLIT_RECORDED=$(echo "$DEPLOYMENT" | jq -r '.workSplitFactory // empty')
+SCOUT_REGISTRY_RECORDED=$(echo "$DEPLOYMENT" | jq -r '.scoutRegistry // empty')
+
+# The libraries a factory was linked against have to be in the compiler input, and forge takes
+# them from the config rather than from a flag. The record is where they live.
+if [ -z "${FOUNDRY_LIBRARIES:-}" ]; then
+  FOUNDRY_LIBRARIES=$(echo "$DEPLOYMENT" | jq -r '
+    (.libraries // {}) | to_entries
+    | map("src/libraries/\(.key).sol:\(.key):\(.value)") | join(",")')
+  export FOUNDRY_LIBRARIES
+fi
+
 
 library_address() {
   local name="$1" addr=""
@@ -189,6 +217,20 @@ verify_library() {
     return
   fi
   verify "$addr" "src/libraries/$name.sol:$name" || note_failure "$name $addr"
+}
+
+# A contract created by CREATE inside another transaction, so it has no creation transaction of
+# its own. Blockscout can often still match one from its internal creation trace, so the guess
+# comes first, and the fallback rebuilds the arguments from the contract's own immutable getters.
+verify_from_immutables() {
+  local addr="$1" contract="$2" sig="$3"; shift 3
+  if verify "$addr" "$contract" --guess-constructor-args; then return 0; fi
+  echo "guess failed for $contract $addr; rebuilding from immutables" >&2
+  local vals=() getter
+  for getter in "$@"; do vals+=("$(read_addr "$addr" "$getter")"); done
+  local enc
+  enc=$(cast abi-encode "$sig" "${vals[@]}") || return 1
+  verify "$addr" "$contract" --constructor-args "$enc"
 }
 
 # A factory, from the compiler input its deploy used. Only if the verifier will not take the
@@ -297,6 +339,52 @@ if [ -n "$LAUNCH_ROUTER_RECORDED" ]; then
     note_failure "LaunchRouter $LAUNCH_ROUTER"
 else
   echo "no launchRouter in the record for chain $CHAIN_ID; skipping it" >&2
+fi
+
+# The agent launchpad. Its constructor is (tokenFactory, router, permit2), all three immutable
+# and all three exposed, so the reads are the constructor arguments and a cross-check on the
+# wiring at the same time. The treasuries it deploys are created inside a user transaction and
+# have no creation transaction of their own; each one verifies from its own immutables, the way
+# a collection does, which is out of scope here.
+if [ -n "$AGENT_FACTORY_RECORDED" ]; then
+  AGENT_FACTORY="$AGENT_FACTORY_RECORDED"
+  AF_ENC=$(cast abi-encode 'c(address,address,address)' \
+    "$(read_addr "$AGENT_FACTORY" 'TOKEN_FACTORY()(address)')" \
+    "$(read_addr "$AGENT_FACTORY" 'ROUTER()(address)')" \
+    "$(read_addr "$AGENT_FACTORY" 'PERMIT2()(address)')")
+  verify "$AGENT_FACTORY" src/AgentTreasuryFactory.sol:AgentTreasuryFactory --constructor-args "$AF_ENC" ||
+    note_failure "AgentTreasuryFactory $AGENT_FACTORY"
+else
+  echo "no agentTreasuryFactory in the record for chain $CHAIN_ID; skipping it" >&2
+fi
+
+# The commission rail: the factory that deploys a launch's split, and the registry those splits
+# read a buyer's scout binding from. A commission is published as a rate on a contract, and a
+# scout can only hold anyone to it by reading the code that enforces it, so these two are the
+# contracts on this list whose source is the product.
+#
+# WorkSplitFactory's constructor is (tokenLaunchFactory), immutable and exposed, so the read below
+# is the constructor argument and a check that the factory on file launches through this network's
+# token rail. The registry is created by CREATE inside that constructor and has no creation
+# transaction of its own.
+if [ -n "$WORK_SPLIT_RECORDED" ]; then
+  WORK_SPLIT="$WORK_SPLIT_RECORDED"
+  WS_ENC=$(cast abi-encode 'c(address)' "$(read_addr "$WORK_SPLIT" 'TOKEN_FACTORY()(address)')")
+  verify "$WORK_SPLIT" src/WorkSplitFactory.sol:WorkSplitFactory --constructor-args "$WS_ENC" ||
+    note_failure "WorkSplitFactory $WORK_SPLIT"
+
+  # The factory names its own registry, and the record names one too. They are written together
+  # by the deploy, so a disagreement means the record was edited by hand: verify the one the
+  # factory's splits actually read, and say which address the record got wrong.
+  SCOUT_ONCHAIN=$(read_addr "$WORK_SPLIT" 'SCOUT_REGISTRY()(address)')
+  if [ -n "$SCOUT_REGISTRY_RECORDED" ] &&
+    [ "$(echo "$SCOUT_REGISTRY_RECORDED" | tr 'A-Z' 'a-z')" != "$(echo "$SCOUT_ONCHAIN" | tr 'A-Z' 'a-z')" ]; then
+    note_failure "scoutRegistry in the record is $SCOUT_REGISTRY_RECORDED; $WORK_SPLIT names $SCOUT_ONCHAIN"
+  fi
+  verify_from_immutables "$SCOUT_ONCHAIN" src/ScoutRegistry.sol:ScoutRegistry \
+    'c(address)' 'SPLIT_FACTORY()(address)' || note_failure "ScoutRegistry $SCOUT_ONCHAIN"
+else
+  echo "no workSplitFactory in the record for chain $CHAIN_ID; skipping it and its registry" >&2
 fi
 
 # NFT collections.
@@ -408,17 +496,6 @@ if [ -n "$TOKEN_FACTORY" ]; then
     verify "$GRADUATION_HOOK" src/hook/LaunchHook.sol:LaunchHook --guess-constructor-args ||
       note_failure "LaunchHook $GRADUATION_HOOK"
   fi
-
-  verify_from_immutables() {
-    local addr="$1" contract="$2" sig="$3"; shift 3
-    if verify "$addr" "$contract" --guess-constructor-args; then return 0; fi
-    echo "guess failed for $contract $addr; rebuilding from immutables" >&2
-    local vals=() getter
-    for getter in "$@"; do vals+=("$(read_addr "$addr" "$getter")"); done
-    local enc
-    enc=$(cast abi-encode "$sig" "${vals[@]}") || return 1
-    verify "$addr" "$contract" --constructor-args "$enc"
-  }
 
   LCOUNT=$(tcall 'launchCount()(uint256)')
   for ((i = 0; i < LCOUNT; i++)); do

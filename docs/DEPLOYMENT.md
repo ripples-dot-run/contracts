@@ -93,6 +93,32 @@ A 46630 broadcast also writes the active token under
 claim amount, cooldown, and reserve. Existing `usdg` records describe the legacy deployment and
 must not be hand-edited into WETH records.
 
+## The commission rail
+
+`script/DeployWorkSplit.s.sol` deploys `WorkSplitFactory`. The factory deploys its `ScoutRegistry`
+from inside its own constructor, so one broadcast produces both addresses:
+
+```bash
+forge script script/DeployWorkSplit.s.sol:DeployWorkSplit \
+  --rpc-url "$RPC_URL" --account <keystore> --broadcast
+```
+
+The launch factory and hook come from the network's own entry in `deployments.json`, and the script
+refuses an address that is not the live pair, so the factory it builds is immutably wired to the
+rail the site reads. On chain 4663 add `ALLOW_MAINNET_DEPLOY=true`.
+
+A broadcast run writes `workSplitFactory` and `scoutRegistry` back into that entry and replaces the
+note beside them. Commit the file. It is what the web app resolves a launch's commission through,
+and it is what the script itself reads on the next run: one factory per network, because a split
+answers only to the factory that deployed it and a second factory makes every commission already
+published unreadable. `WORK_ALLOW_REDEPLOY=true` is the acknowledgment when a redeploy is meant.
+
+Verification comes from the same `script/verify.sh` run as the rest of the stack, once the record
+names the pair: the factory verifies from its one constructor argument, and the registry, which has
+no creation transaction of its own, from its own immutable. A scout holds an artist to a published
+rate by reading the contract that enforces it, so leaving these two unverified leaves the rate
+unbacked.
+
 ## Explorer verification
 
 `script/verify.sh` recompiles from the working tree, so the sources have to be the ones the live

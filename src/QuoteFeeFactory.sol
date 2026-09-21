@@ -21,136 +21,45 @@ import { TokenDeployer } from "./libraries/TokenDeployer.sol";
 import { TokenSocials } from "./AgentToken.sol";
 import { IQuoteRegistry } from "./interfaces/IQuoteRegistry.sol";
 import { ILaunchHook, SeedPlan } from "./hook/interfaces/ILaunchHook.sol";
+import {
+    DevBuyParams,
+    IHookPoolManager,
+    IVestingBinder,
+    Launch,
+    LaunchParams,
+    LinkedParams
+} from "./TokenLaunchFactory.sol";
 
-struct LaunchParams {
-    string name;
-    string symbol;
-    uint256 curveSupply;
-    uint256 lpTokenSupply;
-    uint256 vQuoteInit;
-    uint256 vTokenInit;
-    uint256 graduationQuote;
-    uint64 lpUnlockAt;
-    /// The creator's own charge on top of the platform's trade fee, in basis points, paid to the
-    /// creator in full. Zero is the default and is what most launches ship with.
-    ///
-    /// It sits after `lpUnlockAt` rather than where `tradeFeeBps` used to, so this tuple does not
-    /// encode to the same signature the previous one did. Those two fields were the same widths
-    /// in the other order, and a scanner keyed on `LaunchCreated`'s topic would otherwise read a
-    /// creator's tax as the market's trade fee and report a 0% market wherever a creator set no
-    /// tax at all.
-    uint96 creatorTaxBps;
-    /// The asset this launch settles in: its market, its opening buy and its pool.
-    /// `address(0)` means the factory's default quote. The launch *fee* is not this asset: it is
-    /// `FEE_TOKEN`, and a creator launching against a stock token approves two assets with two
-    /// captions (DQ3).
-    address quote;
-    // ------------------------------------------------------------------ identity
-    //
-    // What the launch writes into its token forever, so a market terminal can show the image,
-    // the blurb and the links without anybody filing anything anywhere. The token's own
-    // `logo()`, `description()` and `socials()` answer these, and nothing can change them after
-    // the launch transaction.
-    //
-    // They sit after every v4 field, so this is the v5 tuple and it hashes to a topic of its
-    // own. `contracts/test/Interfaces.t.sol` pins that topic beside the four before it.
-    //
-    /// URI of the token's image. Required: the image is the reason this data is here at all.
-    string logo;
-    /// Free text, may be empty.
-    string description;
-    // The five links, in the order the launcher rail terminals already index publishes them.
-    // Any of them may be empty; a reader shows the ones that are set.
-    string twitter;
-    string telegram;
-    string discord;
-    string website;
-    string farcaster;
-}
-
-/// One launch, as a third party enumerates it with no indexer and no log history:
-/// `launchCount()` then `launches(offset, limit)`, and `isFromFactory(locker)` to check one.
+/// @notice Registry and deployer for agent token launches on the quote-fee rail: the same launch
+///         machinery `TokenLaunchFactory` runs, keyed to `QuoteFeeHook` instead of `LaunchHook`
+///         and charging its whole 1% trade fee to the treasury rather than splitting most of it
+///         to the creator.
 ///
-/// `locker` is the per-launch contract and the subject every other record keys on: the address
-/// `isFromFactory` answers for, the one `StockLinkRegistry` links a stock token to, and the one
-/// that answers `poolId()`. It replaced the bonding curve in that role when the curve became a
-/// pool: the pool is a 32-byte id rather than an address, and `hook` is a singleton shared by
-/// every launch, so neither can identify one.
-struct Launch {
-    address token;
-    address locker;
-    address hook;
-    address creator;
-}
-
-/// The linked-launch coupling: the token supply reserved for NFT minters, the share of each
-/// NFT mint's quote routed into the curve, and the vesting schedule for the reserved slice.
+///         Here is why this is a second factory and not an edit to the first.
+///         `TokenLaunchFactory`'s `LP_FEE_CREATOR_BPS` is 7,000: on the launches it
+///         already created, 70% of the platform's trade fee is the creator's, paid in whatever
+///         currency the fee happened to land in. `$RIPPLES` and `$KOI` point that 70% at
+///         `BurnRouter` and route their fee this way today, and neither can be repointed without
+///         changing what a live pool's hook already charges, which a v4 pool key cannot do once
+///         opened. This factory is for every launch after that decision: `LP_FEE_CREATOR_BPS` is
+///         zero, so the platform's whole 1% credits the treasury, always in the quote, and a
+///         creator's income is their own `creatorTaxBps` alone, set once at launch.
 ///
-/// The last two fields are the choices a launch makes about who the claim belongs to and whether
-/// it can ever grow a second collection. Both are fixed here and nowhere else: no call on any of
-/// the deployed contracts moves either.
-struct LinkedParams {
-    uint96 nftAllocationBps;
-    uint96 mintToCurveBps;
-    uint64 vestDuration;
-    uint64 vestCliff;
-    /// False: the wallet that minted keeps the vest, whoever holds the piece afterwards. True:
-    /// the vest belongs to the piece and travels with it on every secondary sale.
-    bool objectClaim;
-    /// Whether the creator may attach later collections to this market before it graduates.
-    /// Every wave routes into the same raise and its minters share the same slice pro rata, so
-    /// a launch that leaves this false can never dilute its first minters and one that sets it
-    /// says so before anybody mints.
-    bool wavesOpen;
-}
-
-/// The creator's launch-time options that outlive the params proper: an atomic first buy the
-/// factory runs for the creator (`initialBuy` quote with an `minTokensOut` floor, 0 to skip),
-/// and the wallets that pay no snipe tax. The creator is always exempt so their dev buy is not
-/// taxed at `t=0`. Empty across the board is the plain launch, unchanged.
-struct DevBuyParams {
-    uint256 initialBuy;
-    uint256 minTokensOut;
-    address[] snipeExempt;
-}
-
-/// The binding calls both vesting contracts answer. `AllocationVesting` credits the wallet that
-/// minted and `ObjectVesting` credits the piece, but a launch wires whichever it deployed through
-/// the same two calls.
-interface IVestingBinder {
-    function setCollection(address collection) external;
-    function addCollection(address collection) external;
-}
-
-/// The one call `setLaunchHook` needs beyond the address itself.
-interface IHookPoolManager {
-    // solhint-disable-next-line func-name-mixedcase
-    function POOL_MANAGER() external view returns (address);
-}
-
-/// @notice Registry and deployer for agent token launches. Creators pay the launch fee in the
-///         fee token, and each launch is a full deploy: the token, its LP locker, and a real
-///         Uniswap v4 pool opened and seeded inside the same transaction. No proxies, so every
-///         contract verifies on Blockscout directly.
-///
-///         **The launch is a pool from its first block.** There is no separate curve contract
-///         holding reserves any more. `LaunchHook` (one singleton, mined once, shared by every
-///         launch) is the bonding curve, and a launch's market is a v4 pool keyed to it. That is
-///         the whole point: a standalone curve contract is invisible to the two largest indexers
-///         (GeckoTerminal prices one at `NaN`, DexScreener answers `pairs: null`), while a pool
-///         is read by everything that watches the PoolManager, with no submission and nobody's
-///         permission.
-contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
+///         Every other choice a launch makes here is unchanged from `TokenLaunchFactory`: the
+///         same params, the same quote registry, the same linked-launch and wave machinery, the
+///         same identity fields frozen into the token. Only the fee split and the hook it
+///         registers against differ, which is why the two share every deployer library below and
+///         the launch-params types themselves rather than each declaring its own.
+contract QuoteFeeFactory is Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     /// Ceiling on the launch fee, so a fee change between a creator's approve and their launch
     /// can never pull more than 0.1 of an outstanding `FEE_TOKEN` allowance. The fee is charged
     /// in `FEE_TOKEN` (WETH) whatever a launch settles in, so this bound is in WETH.
     /// Ceiling on the launch fee: a tenth of one whole unit of `FEE_TOKEN`, derived from that
-    /// token's own decimals rather than written as an 18-decimal literal. The literal was `1e17`,
-    /// which is a tenth of one WETH and bounds nothing at all against a six-decimal fee token: on
-    /// a USDC rail the same number admits a hundred billion USDC. Read once at construction, so
-    /// this stays a single immutable load and every 18-decimal rail keeps exactly `1e17`.
+    /// token's own decimals rather than written as an 18-decimal literal. Read once at
+    /// construction, so this stays a single immutable load and every 18-decimal rail keeps
+    /// exactly `1e17`.
     uint256 public immutable MAX_LAUNCH_FEE;
     uint96 public constant BPS_DENOMINATOR = 10_000;
     uint96 public constant MAX_NFT_PROTOCOL_FEE_BPS = 1_000;
@@ -158,11 +67,8 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     /// the NFT factory so the two deployment paths list the same kind of drop.
     uint96 public constant MAX_ROYALTY_BPS = 1_000;
     /// What every market this factory opens charges on a trade, and what none of them can be
-    /// opened charging instead. It used to be a field of `LaunchParams`, bounded only by
-    /// `MAX_TRADE_FEE_BPS`, which meant anyone calling the factory directly could open a market
-    /// that charged nothing for its whole life: no treasury revenue, no creator income, and no
-    /// buy-and-burn, on a rail where every market opened through the form charges 1%. The rate is
-    /// the platform's and it is stated here, once, for every launch.
+    /// opened charging instead. The rate is the platform's and it is stated here, once, for
+    /// every launch.
     uint96 public constant TRADE_FEE_BPS = 100;
     /// The ceiling the rate above is held to, kept because it is what a reader checks the
     /// platform's own rate against.
@@ -170,12 +76,12 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     /// The most a creator may charge on top of the trade fee. The hook holds the same ceiling and
     /// the combined bound behind it, so a launch that slipped past this one still cannot register.
     uint96 public constant MAX_CREATOR_TAX_BPS = 1_000;
-    /// The creator's share of the fees their market earns, from its first trade and for the rest
-    /// of its life. Fixed for every launch and registered on the hook when the pool opens, so it
-    /// is a property of the launch rather than something an owner can change afterwards. The pool
-    /// itself charges nothing: the hook takes the trade fee in `afterSwap` and splits it on this
-    /// share, which at 1% of a trade leaves the creator 0.70% of everything that trades.
-    uint96 public constant LP_FEE_CREATOR_BPS = 7_000;
+    /// Zero: the platform's whole trade fee credits the treasury, always in the quote. A creator
+    /// on this factory earns only through `creatorTaxBps`, set once at launch and paid to them in
+    /// full. `TokenLaunchFactory.LP_FEE_CREATOR_BPS` is 7,000 for the two launches that opened
+    /// before this factory existed; theirs is a currency-of-arrival hook that cannot be
+    /// repointed, so it keeps its own split rather than this one.
+    uint96 public constant LP_FEE_CREATOR_BPS = 0;
     /// The opening tax at `t = 0` and how long it takes to decay to nothing. The figures the
     /// curve rail charged, moved to where the swap now happens.
     uint96 public constant SNIPE_MAX_BPS = 9_900;
@@ -197,10 +103,13 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     uint256 public constant MAX_LOGO_BYTES = 512;
     uint256 public constant MAX_DESCRIPTION_BYTES = 2_048;
     uint256 public constant MAX_SOCIAL_BYTES = 256;
-    /// A Uniswap V4 hook's low 14 bits encode its permissions. `LaunchHook` must carry exactly
-    /// `beforeInitialize | beforeAddLiquidity | beforeRemoveLiquidity | beforeSwap | afterSwap |
-    /// afterSwapReturnsDelta`, and the PoolManager refuses a pool keyed to anything else.
-    uint160 public constant LAUNCH_HOOK_FLAGS = 0x2AC4;
+    /// A Uniswap V4 hook's low 14 bits encode its permissions. `QuoteFeeHook` must carry exactly
+    /// `beforeInitialize | beforeAddLiquidity | beforeRemoveLiquidity | beforeSwap |
+    /// beforeSwapReturnDelta | afterSwap | afterSwapReturnsDelta`, one bit more than
+    /// `TokenLaunchFactory.LAUNCH_HOOK_FLAGS` carries: the extra bit is what lets the hook take
+    /// its fee out of the quote on every swap shape instead of whichever side a trade happened to
+    /// hand it. The PoolManager refuses a pool keyed to anything else.
+    uint160 public constant LAUNCH_HOOK_FLAGS = 0x2ACC;
     uint160 private constant HOOK_FLAG_MASK = uint160((1 << 14) - 1);
     /// The two probe addresses a create-time plan is checked at: the launch token does not exist
     /// yet, and which side of the pool key it lands on depends on an address nobody has chosen.
@@ -219,9 +128,7 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     /// captures its quote at construction and the hook fixes it at registration, so revoking a
     /// quote here closes the door on new launches and cannot reach a live market.
     ///
-    /// Zero until it is wired, and a factory in that state launches in `FEE_TOKEN` alone,
-    /// exactly what a v1 factory does. A v1 factory has no such function at all and reverts the
-    /// call, which a caller reads as "this factory predates per-launch quotes".
+    /// Zero until it is wired, and a factory in that state launches in `FEE_TOKEN` alone.
     address public quoteRegistry;
     address public platformSigner;
     /// The singleton hook every launch's pool is keyed to, and the contract that is the bonding
@@ -254,15 +161,10 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     /// flag onto a token of the same id in a different pass.
     mapping(address passCollection => mapping(uint256 passTokenId => bool)) public passConsumed;
 
-    /// The third generation of this event, and the first that carries a pool id. A launch used
-    /// to be a curve contract, so the third topic was its address; it is now a v4 pool, so the
-    /// third topic is `keccak256(abi.encode(poolKey))`, the same id the PoolManager's own
-    /// `Initialize` and `Swap` carry, which is what lets a scanner join our record to the
-    /// market's price and volume with nothing in between.
-    ///
-    /// The two earlier signatures are still live on testnet, so a scanner needs the union of all
-    /// three; `contracts/test/Interfaces.t.sol` pins them side by side and the freeze there is
-    /// append only.
+    /// Same third-generation shape `TokenLaunchFactory` emits: the third topic is
+    /// `keccak256(abi.encode(poolKey))`, which is what lets a scanner join our record to the
+    /// market's price and volume with nothing in between. `contracts/test/Interfaces.t.sol` pins
+    /// the signature this factory shares with it.
     event LaunchCreated(
         address indexed creator,
         address indexed token,
@@ -359,8 +261,7 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     error PriceOutOfRange();
 
     /// @param feeToken_ The asset the launch fee is charged in, and the default settlement
-    ///        asset until a quote registry is wired. Historically called `quote`, and still the
-    ///        first argument so every existing deployment recipe reads the same.
+    ///        asset until a quote registry is wired.
     constructor(
         address feeToken_,
         address poolManager,
@@ -396,9 +297,7 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice The asset a launch settles in when it names none. The registry's `defaultQuote()`
-    ///         once one is wired, and the fee token before that, which is what every launch on
-    ///         this factory settled in before per-launch quotes existed. Kept under the historic
-    ///         name so `verify.sh`, the deployment record and every existing reader still work.
+    ///         once one is wired, and the fee token before that.
     function QUOTE() public view returns (address) {
         address registry = quoteRegistry;
         return registry == address(0) ? address(FEE_TOKEN) : IQuoteRegistry(registry).defaultQuote();
@@ -426,10 +325,6 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
 
     /// @notice Launch and run the creator's opening buy in the same transaction. The creator
     ///         funds the launch fee and `d.initialBuy`, and receives the tokens from that buy.
-    ///
-    ///         Carrying the first trade inside the launch transaction is not a convenience. A
-    ///         discovery feed on this chain covers under three minutes, so a pool that appears
-    ///         without a trade can fall off the new-pairs list before one arrives.
     function createLaunch(LaunchParams calldata p, DevBuyParams calldata d)
         external
         nonReentrant
@@ -455,21 +350,9 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
         return _deploy(msg.sender, p, none);
     }
 
-    /// @notice Attach a later collection to a launch that already exists.
-    ///
-    ///         A wave is a second, third or fourth drop on one market: the same token, the same
-    ///         raise, the same reserved slice, no new ticker. It routes `mintToCurveBps` of each
-    ///         mint into the raise exactly as the genesis drop does, capped by what the raise
-    ///         still needs, and its minters share the one slice pro rata with everyone who
-    ///         routed before them.
-    ///
-    ///         That last part is why this is not open to every launch. A wave dilutes the
-    ///         genesis minters' claim in proportion to the money it brings, so only a launch
-    ///         that declared `wavesOpen` at create can grow one, and only its creator can, and
-    ///         only until the raise settles. After graduation the contributions are snapshotted
-    ///         and there is nothing left to route into.
-    ///
-    ///         Same flat fee as any other create, because it is one.
+    /// @notice Attach a later collection to a launch that already exists. Same rule
+    ///         `TokenLaunchFactory.launchWave` applies: only a launch that declared `wavesOpen`
+    ///         at create can grow one, only its creator can, and only until the raise settles.
     function launchWave(address locker, CollectionParams calldata np, uint96 mintToCurveBps)
         external
         nonReentrant
@@ -547,12 +430,6 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     ///         something else entirely: a dev buy that unwound, an unsolicited transfer. It
     ///         moves the whole balance, because this contract never holds anything on anyone's
     ///         behalf: fees and dev buys are pulled and spent inside the same transaction.
-    ///
-    ///         Both sweeps are permissionless, so naming the fee token here would otherwise let
-    ///         anyone route real launch-fee revenue out under `TokenWithdrawn` and leave a
-    ///         `FeesWithdrawn` reader under-reporting with nothing on chain to explain the gap.
-    ///         That case emits `FeesWithdrawn` instead: the topic follows the asset, not the
-    ///         entry point.
     function withdrawFees(address token) external nonReentrant {
         if (token == address(0)) revert ZeroAddress();
         IERC20 asset = IERC20(token);
@@ -613,18 +490,10 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
         emit PlatformSignerSet(signer);
     }
 
-    /// @notice Wire the launch hook, once. It is the singleton that is the bonding curve: every
-    ///         launch this factory creates registers against it and opens a pool keyed to it.
-    ///
-    ///         One-shot, because a launch's pool key carries the hook address and cannot be
-    ///         changed afterwards. Repointing this would leave every live market keyed to a hook
-    ///         the factory no longer knows about, which is worse than a factory redeploy. And a
-    ///         factory redeploy is what a wrong value here costs, which is cheap while
-    ///         `launchCount()` is zero and is exactly when it would be caught.
-    ///
-    ///         Two checks, both of which a wrong hook fails silently otherwise: the address must
-    ///         encode the permission bitmap the PoolManager will look for, and the hook must have
-    ///         been mined against the same PoolManager this factory is bound to.
+    /// @notice Wire the launch hook, once. Same one-shot rule `TokenLaunchFactory.setLaunchHook`
+    ///         carries, checked against this factory's own `LAUNCH_HOOK_FLAGS`: the address must
+    ///         encode `QuoteFeeHook`'s permission bitmap and must have been mined against the
+    ///         same PoolManager this factory is bound to.
     ///
     ///         The hook has its own owner and its own `setLaunchpad`, so wiring is two calls on
     ///         two contracts. This one does not and cannot admit the factory to the hook.
@@ -640,9 +509,7 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
         emit LaunchHookSet(hook);
     }
 
-    /// @notice The hook a launch's pool is keyed to, under the name `ITokenLaunchpad` froze. It
-    ///         is now the launch hook rather than a separate graduation gate, because graduation
-    ///         no longer creates a pool: it settles the one the launch has been trading in.
+    /// @notice The hook a launch's pool is keyed to, under the name `ITokenLaunchpad` froze.
     function graduationHook() external view returns (address) {
         return launchHook;
     }
@@ -655,24 +522,13 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
         revert();
     }
 
-    /// @notice Wire the shared quote registry. Deployed separately and shared with the NFT
-    ///         factory, so it is set here rather than taken in the constructor, in the same
-    ///         window before the ownership handoff as the graduation hook and the asset origin.
-    ///         Until it is set every launch settles in the fee token, which is exactly what this
-    ///         factory did before per-launch quotes.
+    /// @notice Wire the shared quote registry. Until it is set every launch settles in the fee
+    ///         token, which is exactly what this factory did before per-launch quotes.
     ///
-    ///         Unlike the graduation hook this is **not** one-shot, deliberately. A one-shot
-    ///         binding is worth having where a wrong value is unrecoverable: a hook the
-    ///         PoolManager would reject bricks graduation for every launch, with the raise
-    ///         stranded behind it. A wrong registry here is not: it is read at create only, so it
-    ///         can only ever refuse the *next* launch, and locking it in would make a
-    ///         mis-wired deploy a full factory redeploy instead of one owner call. And the guard
-    ///         would protect nothing: the owner of this factory owns the registry too, so anyone
-    ///         who could re-point it can already `approveQuote` on the one it points at.
-    ///
-    ///         The registry's `feeToken()` must be this factory's, because the two records are
-    ///         read together: a registry that disagreed would publish an allowlist against a fee
-    ///         asset nobody is charged in. `QuoteRegistrySet` records every change on chain.
+    ///         Not one-shot, deliberately: a wrong registry here is read at create only, so it
+    ///         can only ever refuse the *next* launch, and the owner of this factory owns the
+    ///         registry too, so anyone who could re-point it can already `approveQuote` on the
+    ///         one it points at.
     function setQuoteRegistry(address registry) external onlyOwner {
         if (registry == address(0)) revert ZeroAddress();
         if (registry.code.length == 0) revert NotAContract();
@@ -682,9 +538,9 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Point later linked collections' ERC-7572 document at an origin. Empty publishes
-    ///         none. Standalone token launches deploy no collection and are unaffected. A
-    ///         collection keeps the origin it was born with, so the shape is checked here: an
-    ///         HTTPS origin, no trailing slash, because the collection appends its own path.
+    ///         none. A collection keeps the origin it was born with, so the shape is checked
+    ///         here: an HTTPS origin, no trailing slash, because the collection appends its own
+    ///         path.
     function setAssetOrigin(string calldata origin) external onlyOwner {
         if (!_validAssetOrigin(origin)) revert InvalidAssetOrigin();
         assetOrigin = origin;
@@ -735,11 +591,6 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     /// tax against the address that calls the PoolManager, which is the only address `afterSwap`
     /// ever sees, and the locker is the address `PoolDeployer` named exempt at registration. A
     /// buy sent from anywhere else would be taxed at the opening rate, which is most of it.
-    ///
-    /// The buy is placed with a price limit at the far end of the curve's range, so a buy bigger
-    /// than the launch can fill takes the launch to its cap and hands the rest straight back
-    /// instead of reverting a launch that is otherwise complete. `minTokensOut` is still the
-    /// creator's floor and still unwinds the whole transaction if the fill misses it.
     function _devBuy(address creator, address locker, DevBuyParams memory d) private {
         if (d.initialBuy == 0) return;
         // The opening buy is in the launch's own quote, not the fee token. Read off the locker
@@ -839,7 +690,7 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
 
         // The locker is the linked launch's curve in every sense the collection and the vesting
         // care about: it takes the routed quote, answers the raise, funds the slice and stamps
-        // the clock. `LaunchHook` owns the price and holds no money, so it cannot be either.
+        // the clock. `QuoteFeeHook` owns the price and holds no money, so it cannot be either.
         vesting = lp.objectClaim
             ? ObjectVestingDeployer.deploy(token, locker, lp.vestDuration, lp.vestCliff)
             : VestingDeployer.deploy(token, locker, lp.vestDuration, lp.vestCliff);
@@ -861,8 +712,9 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     }
 
     /// Deploy the locker, register the launch on the hook, open the pool at the registered price
-    /// and put the curve position in it. One delegatecalled library, because the factory's
-    /// runtime had 1,833 bytes of EIP-170 margin and this does not fit in them.
+    /// and put the curve position in it. One delegatecalled library, shared with
+    /// `TokenLaunchFactory`: the plan it carries is the hook's, not this factory's, so the same
+    /// code opens a launch correctly whichever of the two hooks `p.hook` (below) names.
     function _open(
         address creator,
         address token,
@@ -871,13 +723,8 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
         address[] memory snipeExempt,
         bool linked
     ) private returns (PoolDeployer.Opened memory) {
-        // Permanent, and only permanent. The field stays in the tuple so the shape does not move,
-        // and zero is the only value it may carry. It used to accept any time in the future, which
-        // meant `block.timestamp + 1` produced a market the treasury could empty a second later
-        // through `LPLocker.unlock`; a pool with no liquidity refuses every swap, so that market
-        // would have become a honeypot with no way for a holder to tell it apart from this one.
-        // Every market ever opened on either rail was permanent, the app has only ever sent zero,
-        // and "liquidity is permanently locked" is what the launch form promises a creator.
+        // Permanent, and only permanent. See `TokenLaunchFactory._open` for why zero is the only
+        // value this field may carry.
         if (p.lpUnlockAt != 0) revert InvalidLockWindow();
         uint64 unlockAt = type(uint64).max;
         return PoolDeployer.open(
@@ -903,8 +750,7 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
         );
     }
 
-    /// The three writes that make a launch enumerable, and the event that announces it. Shared by
-    /// both paths so the registry stays identical whichever one ran.
+    /// The three writes that make a launch enumerable, and the event that announces it.
     function _record(
         address creator,
         address token,
@@ -963,16 +809,6 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     /// Resolve the launch's settlement asset and admit it. Read at **create only**, and the
     /// only place in this system that reads the registry at all.
     ///
-    /// `address(0)` means the factory's default quote, and naming it explicitly is the same
-    /// thing. Its row binds exactly like any other asset's: the default quote is on the
-    /// allowlist, and its row is what the two launch profiles are sized against, so a launch
-    /// settling in it does not choose its own curve either. Leaving it exempt let a launch in the
-    /// one asset almost every launch settles in declare any shape it liked, including shapes
-    /// whose graduation cannot pair their own raise.
-    ///
-    /// Only a deployment with no registry, or one whose default quote has no row, keeps the
-    /// caller's figures. That is how a factory deployed before the registry stays correct.
-    ///
     /// @return resolved The asset the launch settles in, never zero.
     /// @return quoteDecimals Its own `decimals()`, read here to hold the registry's row against
     ///         the live asset. Nothing keeps it: both call sites discard it.
@@ -1006,11 +842,6 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
 
     /// The reserves are exact equalities: they fix the shape of the curve, and a launch that
     /// declared its own would be a differently priced market wearing an approved asset's name.
-    ///
-    /// The row carries a pricing reserve per profile and the profile is the entry point the
-    /// creator used, so which reserve binds is not a field anyone can set. The target is the
-    /// same figure for both: a launch graduates at one raise on this asset whatever shape it
-    /// opened in.
     function _requireReserves(
         LaunchParams calldata p,
         IQuoteRegistry.QuoteEconomics memory e,
@@ -1023,7 +854,7 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     }
 
     /// An asset that will not say what its smallest unit means cannot be settled in: every
-    /// figure in this system is raw, and there is no normalisation anywhere to fall back on.
+    /// figure here is raw, and there is no normalisation anywhere to fall back on.
     function _quoteDecimals(address quote) private view returns (uint8) {
         try IERC20Metadata(quote).decimals() returns (uint8 d) {
             return d;
@@ -1047,16 +878,9 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
         }
     }
 
-    /// What a launch has to be true of before a token is minted for it.
-    ///
-    /// Three things are checked here and nowhere else, because after this point the launch is
-    /// on chain and irreversible: the supply covers both the position the hook will demand and
-    /// the raise graduation will pair into the permanent one, the seed price of that permanent
-    /// position tracks the curve it closed on, and the curve the launch declared is one the tick
-    /// grid can actually carry.
-    ///
-    /// `linked` is the launch profile, and it is the entry point the creator called rather than
-    /// anything they can set. It selects which worst case the supply is held to: see below.
+    /// What a launch has to be true of before a token is minted for it. See
+    /// `TokenLaunchFactory._validate` for why each of the three checks below is where it is and
+    /// not later: after this point the launch is on chain and irreversible.
     function _validate(LaunchParams calldata p, address quote, bool linked) private view {
         address hook = launchHook;
         if (hook == address(0)) revert HookNotWired();
@@ -1077,32 +901,6 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
             p.graduationQuote, Math.mulDiv(p.vTokenInit, p.vQuoteInit, vQuoteRef), vQuoteRef
         );
 
-        // Graduation pairs the whole raise into the permanent position, and what that costs in
-        // launch token depends on how the raise arrived. Refuse a launch that could not open
-        // that position rather than find out at graduation, after the money is in: the
-        // settlement runs once, and what it cannot pair is credited to the treasury, which is
-        // the creator's raise leaving the market it was raised for.
-        //
-        // The two profiles are funded differently, so they are held to different worst cases,
-        // and that is the whole difference between them.
-        //
-        // A linked raise can arrive entirely as an NFT collection's routed mint revenue. The
-        // pool never traded, so nothing was sold and the price is still the launch price, and
-        // pairing the whole raise there costs the most token a graduation can ever cost.
-        //
-        // A standalone launch registers no contributor, so no collection can route it a wei and
-        // its raise can only arrive through the pool, one trade at a time, moving the price on
-        // every one. Its worst case is the far end of the same curve: the traverse is paid for
-        // in launch token that is now in buyers' hands, so what pairs the raise is the supply
-        // the curve position never took. Holding it to the linked case instead would force it to
-        // open within a quarter of its graduation price, which is why the standalone profile
-        // exists.
-        //
-        // What keeps the two apart is that a standalone launch stays standalone. The hook fixes
-        // the contributor at registration and has no setter for it, `recordContribution` refuses
-        // a launch whose contributor is zero, and `LPLocker.contribute` refuses a caller that is
-        // not the collection the factory bound on the linked path. `_deploy` reads the
-        // registration back and refuses to return a standalone launch that has one.
         uint256 seedable = total;
         if (linked) {
             if (Math.mulDiv(p.graduationQuote, p.vTokenInit, p.vQuoteInit) > total) {
@@ -1123,22 +921,16 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
             revert SeedPriceOutOfBand();
         }
 
-        // The curve position itself, asked of the hook rather than re-derived here. It reverts on
-        // a band the tick grid cannot hold and on liquidity that would not fit the pool, and it
-        // answers how much of the supply the position consumes. Asking it against `seedable`
-        // rather than the whole mint is what holds a standalone launch to the paragraph above:
-        // the position is sized off the launch's own reserves, so this is the launch's actual
-        // traverse rather than a closed form standing in for it. Both currency orderings are
-        // checked because the launch token's address does not exist yet and nobody chooses which
-        // side of the quote it lands on.
+        // The curve position itself, asked of the hook rather than re-derived here. Both currency
+        // orderings are checked because the launch token's address does not exist yet and nobody
+        // chooses which side of the quote it lands on.
         _requirePlanFits(hook, quote, p, seedable, PROBE_BELOW);
         _requirePlanFits(hook, quote, p, seedable, PROBE_ABOVE);
     }
 
     /// The identity is frozen by the token's constructor, so this is the last block in which it
-    /// can be refused. An empty logo is refused rather than defaulted: a launch that lists with
-    /// no image is the failure this data exists to prevent, and it cannot be repaired afterwards.
-    /// An empty description and empty link slots are fine, and are what most launches ship with.
+    /// can be refused. An empty logo is refused rather than defaulted, and an empty description
+    /// and empty link slots are fine, and are what most launches ship with.
     function _validateIdentity(LaunchParams calldata p) private pure {
         uint256 logoBytes = bytes(p.logo).length;
         if (logoBytes == 0 || logoBytes > MAX_LOGO_BYTES) revert InvalidTokenIdentity();
@@ -1153,8 +945,7 @@ contract TokenLaunchFactory is Ownable2Step, ReentrancyGuard {
     }
 
     /// Mint the launch's whole supply to this factory, with the identity the launch declared
-    /// written into the token for good. One function for both profiles, and its own frame: the
-    /// linked path is already at the compiler's stack limit, and the identity is seven strings.
+    /// written into the token for good.
     function _mint(LaunchParams calldata p, uint256 supply) private returns (address) {
         TokenSocials memory s = TokenSocials({
             twitter: p.twitter,
